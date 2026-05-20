@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable
+import re
 
 import numpy as np
 import pandas as pd
@@ -23,6 +24,59 @@ REQUIRED_COLUMNS = [
     DISCHARGE_COL,
 ]
 
+COLUMN_ALIASES = {
+    DATE_COL: [
+        "date",
+        "reporting date",
+        "day",
+    ],
+    INTAKE_COL: [
+        "apprehended",
+        "children apprehended",
+        "children apprehended and placed in cbp custody",
+        "children apprehended placed in cbp custody",
+        "children placed in cbp custody",
+        "daily intake",
+        "intake",
+        "intake volume",
+    ],
+    CBP_LOAD_COL: [
+        "cbp custody",
+        "children in cbp custody",
+        "children currently in cbp custody",
+        "active cbp custody",
+        "active cbp care load",
+        "cbp care load",
+    ],
+    TRANSFER_COL: [
+        "transferred",
+        "transfers",
+        "children transferred",
+        "children transferred out of cbp custody",
+        "transferred out of cbp custody",
+        "transfers to hhs",
+        "flow into hhs",
+        "hhs inflow",
+    ],
+    HHS_LOAD_COL: [
+        "hhs care",
+        "children in hhs care",
+        "children currently in hhs care",
+        "active hhs care",
+        "active hhs care load",
+        "hhs care load",
+    ],
+    DISCHARGE_COL: [
+        "discharged",
+        "discharges",
+        "children discharged",
+        "children discharged from hhs care",
+        "discharged from hhs care",
+        "hhs discharges",
+        "successful sponsor placements",
+    ],
+}
+
 
 @dataclass(frozen=True)
 class ValidationResult:
@@ -35,9 +89,14 @@ class ValidationResult:
 
 def load_time_series(source) -> pd.DataFrame:
     data = pd.read_csv(source)
+    data = standardize_columns(data)
     missing = [column for column in REQUIRED_COLUMNS if column not in data.columns]
     if missing:
-        raise ValueError(f"Missing required columns: {', '.join(missing)}")
+        available = ", ".join(str(column) for column in data.columns)
+        raise ValueError(
+            "Missing required columns: "
+            f"{', '.join(missing)}. Available columns in uploaded file: {available}"
+        )
 
     data = data[REQUIRED_COLUMNS].copy()
     data[DATE_COL] = pd.to_datetime(data[DATE_COL], errors="coerce")
@@ -49,6 +108,25 @@ def load_time_series(source) -> pd.DataFrame:
 
     data = data.sort_values(DATE_COL).reset_index(drop=True)
     return data
+
+
+def standardize_columns(data: pd.DataFrame) -> pd.DataFrame:
+    normalized_to_original = {_normalize_column(column): column for column in data.columns}
+    rename_map = {}
+
+    for required_column, aliases in COLUMN_ALIASES.items():
+        candidates = [required_column, *aliases]
+        for candidate in candidates:
+            normalized = _normalize_column(candidate)
+            if normalized in normalized_to_original:
+                rename_map[normalized_to_original[normalized]] = required_column
+                break
+
+    return data.rename(columns=rename_map)
+
+
+def _normalize_column(column: object) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(column).strip().lower())
 
 
 def validate_data(data: pd.DataFrame) -> ValidationResult:
@@ -157,10 +235,12 @@ def aggregate_metrics(data: pd.DataFrame, granularity: str) -> pd.DataFrame:
 
 def compute_kpis(data: pd.DataFrame) -> dict[str, float]:
     latest = data.iloc[-1]
+    volatility = data["Total System Load"].pct_change().tail(14).std(skipna=True)
+    volatility_index = np.nan if pd.isna(volatility) else volatility * 100
     return {
         "Total Children Under Care": float(latest["Total System Load"]),
         "Net Intake Pressure": float(data["Net Daily Intake"].tail(7).mean()),
-        "Care Load Volatility Index": float(data["Total System Load"].pct_change().tail(14).std(skipna=True) * 100),
+        "Care Load Volatility Index": float(volatility_index),
         "Backlog Accumulation Rate": float(data["Net Daily Intake"].tail(14).clip(lower=0).mean()),
         "Discharge Offset Ratio": float(data["Discharge Offset Ratio"].tail(14).mean(skipna=True)),
     }

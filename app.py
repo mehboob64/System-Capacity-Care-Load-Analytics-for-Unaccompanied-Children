@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from io import BytesIO
 from pathlib import Path
 
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
@@ -13,6 +15,7 @@ from src.analytics import (
     HHS_LOAD_COL,
     INTAKE_COL,
     TRANSFER_COL,
+    REQUIRED_COLUMNS,
     aggregate_metrics,
     compute_kpis,
     detect_stress_windows,
@@ -32,20 +35,48 @@ SAMPLE_PATH = Path("data/sample_uac_daily.csv")
 
 
 @st.cache_data
-def cached_load(source):
-    return load_time_series(source)
+def cached_load_csv(file_bytes: bytes):
+    return load_time_series(BytesIO(file_bytes))
+
+
+@st.cache_data
+def cached_load_sample(path: str):
+    return load_time_series(path)
+
+
+def schema_template_csv() -> bytes:
+    template = pd.DataFrame(
+        [
+            {
+                DATE_COL: "2025-01-01",
+                INTAKE_COL: 0,
+                CBP_LOAD_COL: 0,
+                TRANSFER_COL: 0,
+                HHS_LOAD_COL: 0,
+                DISCHARGE_COL: 0,
+            }
+        ],
+        columns=REQUIRED_COLUMNS,
+    )
+    return template.to_csv(index=False).encode("utf-8")
 
 
 def format_number(value: float) -> str:
-    if value != value:
+    if pd.isna(value):
         return "N/A"
     return f"{value:,.0f}"
 
 
 def format_percent(value: float) -> str:
-    if value != value:
+    if pd.isna(value):
         return "N/A"
     return f"{value:.1%}"
+
+
+def format_percent_points(value: float) -> str:
+    if pd.isna(value):
+        return "N/A"
+    return f"{value:.2f}%"
 
 
 st.title("System Capacity & Care Load Analytics")
@@ -54,15 +85,41 @@ st.caption("Operational monitoring framework for CBP-to-HHS care load, flow bala
 with st.sidebar:
     st.header("Controls")
     uploaded_file = st.file_uploader("Upload daily UAC CSV", type=["csv"])
-    source = uploaded_file if uploaded_file else SAMPLE_PATH
+    st.download_button(
+        "Download CSV template",
+        schema_template_csv(),
+        file_name="uac_dashboard_template.csv",
+        mime="text/csv",
+    )
     granularity = st.segmented_control("Time granularity", ["Daily", "Weekly", "Monthly"], default="Daily")
     show_rolling = st.toggle("Show rolling averages", value=True)
     show_stress = st.toggle("Highlight stress windows", value=True)
     st.info("Bundled sample data is synthetic. Upload official data for operational use.")
 
-raw = cached_load(source)
+try:
+    if uploaded_file is not None:
+        uploaded_bytes = uploaded_file.getvalue()
+        raw = cached_load_csv(uploaded_bytes)
+        st.sidebar.caption(f"Loaded: {uploaded_file.name} ({len(uploaded_bytes):,} bytes)")
+    else:
+        raw = cached_load_sample(str(SAMPLE_PATH))
+        st.sidebar.caption("Loaded: synthetic sample data")
+except ValueError as error:
+    st.error("The uploaded file does not match the dashboard schema.")
+    st.write(str(error))
+    st.subheader("Required columns")
+    st.dataframe(pd.DataFrame({"Column name": REQUIRED_COLUMNS}), use_container_width=True, hide_index=True)
+    st.info(
+        "Tip: the app now accepts several common alternate names, but each required metric still needs one matching column."
+    )
+    st.stop()
+
 validation = validate_data(raw)
 daily = prepare_daily_metrics(raw)
+
+if daily.empty:
+    st.error("No valid dated rows were found in the uploaded file.")
+    st.stop()
 
 min_date = daily[DATE_COL].min().date()
 max_date = daily[DATE_COL].max().date()
@@ -76,6 +133,11 @@ else:
     start_date, end_date = min_date, max_date
 
 filtered_daily = daily[(daily[DATE_COL].dt.date >= start_date) & (daily[DATE_COL].dt.date <= end_date)]
+
+if filtered_daily.empty:
+    st.warning("No records are available for the selected date range.")
+    st.stop()
+
 display_data = aggregate_metrics(filtered_daily, granularity)
 kpis = compute_kpis(filtered_daily)
 stress_windows = detect_stress_windows(filtered_daily)
@@ -83,7 +145,7 @@ stress_windows = detect_stress_windows(filtered_daily)
 kpi_cols = st.columns(5)
 kpi_cols[0].metric("Total Children Under Care", format_number(kpis["Total Children Under Care"]))
 kpi_cols[1].metric("Net Intake Pressure", format_number(kpis["Net Intake Pressure"]))
-kpi_cols[2].metric("Volatility Index", f"{kpis['Care Load Volatility Index']:.2f}%")
+kpi_cols[2].metric("Volatility Index", format_percent_points(kpis["Care Load Volatility Index"]))
 kpi_cols[3].metric("Backlog Accumulation", format_number(kpis["Backlog Accumulation Rate"]))
 kpi_cols[4].metric("Discharge Offset", format_percent(kpis["Discharge Offset Ratio"]))
 
